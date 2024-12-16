@@ -3,8 +3,12 @@ package main
 import (
 	"bufio"
 	"crypto"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -20,10 +24,11 @@ import (
 // TODO: fixa fingertable
 // TODO: fixa successor listan
 // TODO: fixa filer
-
 // TODO: fixa mutex
+
 // TODO: encryption
 // TODO: säerhetskopiera filer
+// TODO: secure file transfer
 
 //	type NodeIdentifier struct {
 //		Id      string
@@ -41,11 +46,15 @@ type ChordNode struct {
 
 	Bucket map[string][]byte
 
+	ExtraBucket map[string][]byte
+
 	n_successors int
 	ts           int
 	tff          int
 	tcp          int
 	mutex        sync.Mutex
+
+	key []byte
 }
 
 //	func (n *ChordNode) background() {
@@ -57,7 +66,6 @@ type ChordNode struct {
 //		}
 //		n.PrintState(&Empty{}, &Empty_reply{})
 //	}
-const max_n = 15
 
 func (n *ChordNode) background_stabilize() {
 	for {
@@ -176,6 +184,14 @@ func main() {
 		fmt.Println("joining!")
 		port_string := strconv.Itoa(chord_port)
 		node.join(NodeAddress(chord_ip + ":" + port_string))
+	} else {
+
+		key, r := generateRandomKey(32)
+		if r != nil {
+			fmt.Println("Error generating key:", r)
+			return
+		}
+		node.key = key
 	}
 
 	// testing printState
@@ -319,11 +335,13 @@ func (node *ChordNode) stabilize() {
 	}
 
 	reply_id := bigInt_to_key(hashAddress(reply.Address))
+	transfer_files := false
 	if reply.Address != "" && between(node.Id, reply_id, bigInt_to_key(hashAddress(node.get_successor())), false) {
 		node.add_successor(reply.Address)
+		transfer_files = true
 	}
 
-	arg := Notify{Address: node.Address}
+	arg := Notify{Address: node.Address, Bucket: node.Bucket}
 	notifyReply := NotifyReply{}
 	notifyCallOk := call(string(node.get_successor()), "ChordNode.Notify", &arg, &notifyReply)
 	if !notifyCallOk {
@@ -333,6 +351,25 @@ func (node *ChordNode) stabilize() {
 	// fmt.Println("Successor did not update it's predecessor after notify: ", node.get_successor())
 	//	return
 	//}
+	if len(node.key) == 0 && len(notifyReply.Key) > 0 {
+		node.key = notifyReply.Key
+	}
+	pre_id := bigInt_to_key(hashAddress(node.Predecessor))
+	// fmt.Println("bucket: ", notifyReply.Bucket)
+	for file, content := range notifyReply.Bucket {
+		if between(pre_id, bigInt_to_key(hashFileName(file)), node.Id, true) {
+			node.Bucket[file] = content
+		}
+	}
+
+	if transfer_files {
+		successor_id := bigInt_to_key(hashAddress(node.get_successor()))
+		for file := range node.Bucket {
+			if between(node.Id, bigInt_to_key(hashFileName(file)), successor_id, true) {
+				delete(node.Bucket, file)
+			}
+		}
+	}
 
 	successorsArg := GetSuccessors{}
 	successorsReply := GetSuccessorsReply{}
@@ -371,6 +408,10 @@ func (node *ChordNode) check_predecessor() {
 	if !callOk {
 		fmt.Println("predecessor call failed: ", node.Predecessor)
 		node.mutex.Lock()
+		for file, content := range node.ExtraBucket {
+			node.Bucket[file] = content
+		}
+		node.ExtraBucket = map[string][]byte{}
 		node.Predecessor = ""
 		node.mutex.Unlock()
 	}
@@ -380,8 +421,20 @@ func (node *ChordNode) Notify(arg *Notify, reply *NotifyReply) error {
 	id := bigInt_to_key(hashAddress(arg.Address))
 	// fmt.Println("node.Predecessor: ", node.Predecessor)
 	if node.Predecessor == "" || between(bigInt_to_key(hashAddress(node.Predecessor)), id, node.Id, false) {
+		newMap := map[string][]byte{}
+		reply.Bucket = newMap
 		node.mutex.Lock()
 		node.Predecessor = arg.Address
+		pre_id := bigInt_to_key(hashAddress(arg.Address))
+		for file, content := range node.Bucket {
+			newMap[file] = content
+			if !between(pre_id, bigInt_to_key(hashFileName(file)), node.Id, true) {
+				delete(node.Bucket, file)
+			}
+		}
+		if len(node.key) > 0 {
+			reply.Key = node.key
+		}
 		node.mutex.Unlock()
 		reply.Confirm = true
 		if node.Address == node.get_successor() {
@@ -392,13 +445,26 @@ func (node *ChordNode) Notify(arg *Notify, reply *NotifyReply) error {
 	} else {
 		reply.Confirm = false
 	}
+	if node.Predecessor == arg.Address {
+		node.mutex.Lock()
+		pre_id := bigInt_to_key(hashAddress(node.Predecessor))
+		node.ExtraBucket = map[string][]byte{}
+		for file, content := range arg.Bucket {
+			if between(pre_id, bigInt_to_key(hashFileName(file)), node.Id, true) {
+				node.Bucket[file] = content
+			} else {
+				node.ExtraBucket[file] = content
+			}
+		}
+		node.mutex.Unlock()
+	}
 	return nil
 }
 
 func (n *ChordNode) Put(args *Put, reply *PutReply) error {
 	n.mutex.Lock()
 	defer n.mutex.Unlock()
-	fmt.Println("put: ", string(args.Id), ", file: ", args.FileName, ", content: \n", string(args.FileContent))
+	fmt.Println("put file: ", args.FileName)
 
 	n.Bucket[args.FileName] = args.FileContent // security issue?
 	reply.Confirm = true
@@ -448,6 +514,12 @@ func (n *ChordNode) StoreFile(fileName string) {
 		return
 	}
 
+	bytes, r := aesEncyption(bytes, n.key)
+	if r != nil {
+		fmt.Println("ErrorEncyptio:", r)
+	}
+	// fmt.Println("this is the encrypted data:", bytes)
+
 	arg := FindClosestSuccessor{Id: bigInt_to_key(hashFileName(fileName))}
 	reply := FindClosestSuccessorReply{}
 	n.Find_successor(&arg, &reply)
@@ -460,8 +532,13 @@ func (n *ChordNode) StoreFile(fileName string) {
 	putReply := PutReply{}
 	callOk := call(string(reply.Address), "ChordNode.Put", &putArgs, &putReply)
 
-	if !(callOk && putReply.Confirm) {
+	if !callOk {
 		fmt.Println("call to put file on node failed: ", reply.Address)
+		return
+	}
+	if !putReply.Confirm {
+		fmt.Println("could not store file: ", fileName)
+		return
 	}
 }
 
@@ -478,11 +555,23 @@ func (n *ChordNode) Lookup(fileName string) {
 	getReply := GetReply{}
 	callOk := call(string(reply.Address), "ChordNode.Get", &getArgs, &getReply)
 
-	if !(callOk && getReply.Confirm) {
-		fmt.Println("call to put file on node failed: ", reply.Address)
+	if !callOk {
+		fmt.Println("call to get file on node failed: ", reply.Address)
+		return
+	}
+	if !getReply.Confirm {
+		fmt.Println("could not get file: ", fileName)
+		return
 	}
 
-	fmt.Println("Identifier: ", bigInt_to_key(hashAddress(reply.Address)), " Address: ", string(reply.Address), " Content: ", string(getReply.Content))
+	orginalData, r := aesdecrption(getReply.Content, n.key)
+	if r != nil {
+		fmt.Println("Error decrypted data:", r)
+		return
+	}
+	fmt.Println("this is the decrypted data:", orginalData)
+
+	fmt.Println("Identifier: ", bigInt_to_key(hashAddress(reply.Address)), " Address: ", string(reply.Address), " Content: ", string(orginalData))
 }
 
 func (n *ChordNode) PrintState(args *Empty, reply *EmptyReply) error {
@@ -504,9 +593,13 @@ func (n *ChordNode) PrintState(args *Empty, reply *EmptyReply) error {
 	for i, finger := range n.Fingers {
 		fmt.Println("	", i, ": ", finger, " id: ", bigInt_to_key(hashAddress(finger)))
 	}
-	fmt.Println("File: ")
-	for key, value := range n.Bucket {
-		fmt.Println("	", key, ": \n", string(value)[:10])
+	fmt.Println("Files: ")
+	for file := range n.Bucket {
+		fmt.Println("	", file)
+	}
+	fmt.Println("Safety Files: ")
+	for file := range n.ExtraBucket {
+		fmt.Println("	", file)
 	}
 
 	return nil
@@ -679,4 +772,70 @@ func (node *ChordNode) get_successor() NodeAddress {
 	defer node.mutex.Unlock()
 
 	return node.Successors[0]
+}
+
+// -------------------------------encryption------------------------------------------------
+
+func padding(data []byte, blockSize int) []byte {
+	valueToPad := blockSize - len(data)%blockSize
+	padText := make([]byte, valueToPad)
+	for i := 0; i < len(padText); i++ {
+		padText[i] = byte(valueToPad)
+	}
+	return append(data, padText...)
+}
+
+func generateRandomKey(length int) ([]byte, error) {
+	key := make([]byte, length)
+	_, r := io.ReadFull(rand.Reader, key)
+	if r != nil {
+		fmt.Println("Error generating new key:", r)
+	}
+	return key, nil
+}
+
+func aesEncyption(data []byte, key []byte) ([]byte, error) {
+	block, r := aes.NewCipher(key)
+	if r != nil {
+		fmt.Println("Error generating new cipher:", r)
+	}
+
+	// generating a random iv
+	iv := make([]byte, aes.BlockSize)
+	_, err := io.ReadFull(rand.Reader, iv)
+	if err != nil {
+		fmt.Println("Error generating iv:", err)
+	}
+
+	//makineg the text a multiple of the block size
+	paddeddata := padding(data, aes.BlockSize)
+	mode := cipher.NewCBCEncrypter(block, iv) // create a CBC mode encrypter
+	cipherData := make([]byte, len(paddeddata))
+	mode.CryptBlocks(cipherData, paddeddata) //encrypting data
+	finalCipherData := append(iv, cipherData...)
+
+	return finalCipherData, nil
+
+}
+
+func aesdecrption(finalCipherData []byte, key []byte) ([]byte, error) {
+	block, r := aes.NewCipher(key)
+	if r != nil {
+		fmt.Println("Error generating new cipher:", r)
+	}
+
+	iv := finalCipherData[:aes.BlockSize]
+	finalCipherData = finalCipherData[aes.BlockSize:]
+	mode := cipher.NewCBCDecrypter(block, iv)
+	data := make([]byte, len(finalCipherData))
+	mode.CryptBlocks(data, finalCipherData)
+	data = unpadding(data)
+	return data, nil
+
+}
+
+func unpadding(data []byte) []byte {
+	length := len(data)
+	padding := int(data[length-1])
+	return data[:length-padding]
 }

@@ -20,10 +20,13 @@ type FindClosestSuccessorReply struct {
 
 type Notify struct {
 	Address NodeAddress
+	Bucket  map[string][]byte
 }
 
 type NotifyReply struct {
 	Confirm bool
+	Bucket  map[string][]byte
+	Key     []byte
 }
 
 type GetPredecessor struct {
@@ -50,7 +53,6 @@ type GetReply struct {
 }
 
 type Put struct {
-	Id          Key
 	FileName    string
 	FileContent []byte
 }
