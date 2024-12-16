@@ -41,28 +41,29 @@ type GetSuccessorsReply struct {
 }
 
 type Get struct {
-	Id Key
+	FileName string
 }
 
-type Get_reply struct {
-	Content string
+type GetReply struct {
+	Content []byte
 	Confirm bool
 }
 
 type Put struct {
-	Id    Key
-	Value string
+	Id          Key
+	FileName    string
+	FileContent []byte
 }
 
-type Put_reply struct {
+type PutReply struct {
 	Confirm bool
 }
 
 type Delete struct {
-	Id Key
+	FileName string
 }
 
-type Delete_reply struct {
+type DeleteReply struct {
 	Confirm bool
 }
 
