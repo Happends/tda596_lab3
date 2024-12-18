@@ -1,0 +1,96 @@
+syntax = "proto3";
+
+option go_package = "pkg/ctfp";
+
+message KeyValuePair {
+  string key = 1;
+  bytes value = 2;
+}
+
+message FindSuccessorArgs {
+  string Key = 1;
+}
+
+message FindSuccessorReply {
+	bool Ok= 1;
+	string Address = 2;
+}
+
+message NotifyArgs {
+	string Address = 1;
+	repeated KeyValuePair Bucket = 2;
+}
+
+message NotifyReply {
+	bool Confirm  = 1;
+	repeated KeyValuePair Bucket = 2;
+}
+
+message GetSuccessorsArgs {
+}
+
+message GetSuccessorsReply {
+	repeated string Successors  = 1;
+}
+
+message GetPredecessorArgs {
+}
+
+message GetPredecessorReply {
+	string Address = 1;
+}
+
+message GetArgs {
+	string FileName = 1;
+}
+
+message GetReply {
+	bool Confirm = 1;
+	bytes Content = 2;
+}
+
+message PutArgs {
+	string FileName     = 1;
+	bytes FileContent = 2;
+}
+
+message PutReply {
+	bool Confirm = 1;
+}
+
+message DeleteArgs {
+	string FileName = 1;
+}
+
+message DeleteReply {
+	bool Confirm = 1;
+}
+
+message GetAESKeyArgs {
+	bytes Key = 1;
+}
+
+message GetAESKeyReply {
+	bytes AESKey = 1;
+}
+
+
+message EmptyArgs {
+}
+message EmptyReply {
+}
+
+service ChordFileTransfer  {
+  rpc FindSuccessor(FindSuccessorArgs) returns (FindSuccessorReply);
+  rpc Notify(NotifyArgs) returns (NotifyReply);
+  rpc GetSuccessors(GetSuccessorsArgs) returns (GetSuccessorsReply);
+  rpc GetPredecessor(GetPredecessorArgs) returns (GetPredecessorReply);
+  rpc Get(GetArgs) returns (GetReply);
+  rpc Put(PutArgs) returns (PutReply);
+  rpc Delete(DeleteArgs) returns (DeleteReply);
+  rpc GetAESKey(GetAESKeyArgs) returns (GetAESKeyReply);
+  rpc PrintState(EmptyArgs) returns (EmptyReply);
+}
+
+
+

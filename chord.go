@@ -2,23 +2,32 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math/big"
 	"net"
-	"net/http"
-	"net/rpc"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
+
+	ctfp "chord/chordFileTransfer"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 )
 
 // TODO: fixa fingertable
@@ -54,7 +63,13 @@ type ChordNode struct {
 	tcp          int
 	mutex        sync.Mutex
 
-	key []byte
+	AESkey        []byte
+	RSAkeyPrivate []byte
+	RSAkeyPublic  []byte
+	ServerCert    tls.Certificate
+	CaCert        *x509.CertPool
+
+	ctfp.UnimplementedChordFileTransferServer
 }
 
 //	func (n *ChordNode) background() {
@@ -179,25 +194,109 @@ func main() {
 	port_string := strconv.Itoa(port)
 	node := CreateChord(ip, port_string, n_successors, ts, tff, tcp, id)
 
+	// create rsa keys
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		fmt.Println("unable to generate rsa key")
+		return
+	}
+	node.RSAkeyPrivate = x509.MarshalPKCS1PrivateKey(privateKey)
+	node.RSAkeyPublic = x509.MarshalPKCS1PublicKey(&privateKey.PublicKey)
+
+	// template := x509.Certificate{
+	// 	SerialNumber: big.NewInt(1),
+	// 	Issuer: pkix.Name{
+	// 		Organization: []string{"Bros Org"},
+	// 		CommonName:   "localhost",
+	// 	},
+	// 	Subject: pkix.Name{
+	// 		Organization: []string{"Bros Org"},
+	// 		CommonName:   "localhost",
+	// 	},
+	// 	NotBefore:   time.Now(),
+	// 	NotAfter:    time.Now().AddDate(0, 0, 1), // one day
+	// 	IsCA:        false,
+	// 	KeyUsage:    x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+	// 	ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	// 	DNSNames:    []string{"localhost"},
+	// 	IPAddresses: []net.IP{net.ParseIP("127.0.0.1")},
+	// }
+	// caCert, err := os.ReadFile("ca.crt")
+	// if err != nil {
+	// 	fmt.Println("Error reading CA certificate:", err)
+	// 	return
+	// }
+	// caBlock, _ := pem.Decode(caCert)
+	// caCertParsed, err := x509.ParseCertificate(caBlock.Bytes)
+	// node.CaCert = caCertParsed
+	// if err != nil {
+	// 	fmt.Println("Error parsing CA certificate:", err)
+	// 	return
+	// }
+
+	// caKey, err := os.ReadFile("ca.key")
+	// if err != nil {
+	// 	fmt.Println("Error reading CA private key:", err)
+	// 	return
+	// }
+	// caKeyBlock, _ := pem.Decode(caKey)
+	// caPrivateKey, err := x509.ParsePKCS8PrivateKey(caKeyBlock.Bytes)
+	// if err != nil {
+	// 	fmt.Println("Error parsing CA private key:", err)
+	// 	return
+	// }
+
+	// certificate, err := x509.CreateCertificate(rand.Reader, &template, caCertParsed, &privateKey.PublicKey, caPrivateKey)
+	// if err != nil {
+	// 	fmt.Println("could not initiate certificate: ", err)
+	// 	return
+	// }
+	// node.ServerCert = certificate
+
+	serverCert, err := tls.LoadX509KeyPair("server.crt", "server.key")
+	if err != nil {
+		log.Fatalf("Failed to load server certificate and key: %v", err)
+	}
+	node.ServerCert = serverCert
+
+	caCert, err := os.ReadFile("ca.crt")
+	if err != nil {
+		log.Fatal("Failed to read CA certificate:", err)
+	}
+
+	// Create a certificate pool
+	certPool := x509.NewCertPool()
+	if !certPool.AppendCertsFromPEM(caCert) {
+		log.Fatal("Failed to append CA certificates to pool")
+	}
+	node.CaCert = certPool
+
+	node.startChord()
+
 	// join chord if specified
 	if chord_ip != "" && chord_port != -1 {
 		fmt.Println("joining!")
 		port_string := strconv.Itoa(chord_port)
-		node.join(NodeAddress(chord_ip + ":" + port_string))
+		err := node.join(NodeAddress(chord_ip + ":" + port_string))
+		if err != nil {
+			fmt.Println("unable to join chord ring: ", err)
+			return
+		}
+		fmt.Println("succesful join!")
 	} else {
 
 		key, r := generateRandomKey(32)
 		if r != nil {
-			fmt.Println("Error generating key:", r)
+			fmt.Println("Error generating key: ", r)
 			return
 		}
-		node.key = key
+		node.AESkey = key
 	}
 
 	// testing printState
-	arg := Empty{}
-	reply := EmptyReply{}
-	call(string(node.Address), "ChordNode.PrintState", &arg, &reply)
+	arg := ctfp.EmptyArgs{}
+	reply := ctfp.EmptyReply{}
+	node.call(string(node.Address), "PrintState", &arg, &reply)
 	// time.Sleep(10 * time.Second)
 
 	for {
@@ -226,7 +325,7 @@ func main() {
 			}
 			node.StoreFile(textArr[1])
 		case "PrintState":
-			node.PrintState(&Empty{}, &EmptyReply{})
+			node.PrintState(context.TODO(), &ctfp.EmptyArgs{})
 		default:
 			fmt.Println("invalid command: ", text)
 		}
@@ -244,76 +343,96 @@ func (node *ChordNode) closest_preceding_node(id Key) (bool, NodeAddress) {
 	return false, node.Address
 }
 
-func (node *ChordNode) Find_successor(arg *FindClosestSuccessor, reply *FindClosestSuccessorReply) error {
+func (n *ChordNode) FindSuccessor(ctx context.Context, args *ctfp.FindSuccessorArgs) (*ctfp.FindSuccessorReply, error) {
+	reply := ctfp.FindSuccessorReply{}
 	// if node.Fingers[0] == node.Address {
 	// 	reply.Address = node.Address
 	// 	reply.Ok = false
 	// 	return nil
 	// }
-	id := arg.Id
+	id := Key(args.Key)
 	// fmt.Println("arg: ", arg.Id)
 	// fmt.Println("before getting successor")
-	succ := node.get_successor()
+	succ := n.get_successor()
 	// fmt.Println("gotten successor")
-	if between(node.Id, id, bigInt_to_key(hashAddress(succ)), true) {
-		reply.Address = succ
+	if between(n.Id, id, bigInt_to_key(hashAddress(succ)), true) {
+		reply.Address = string(succ)
 		reply.Ok = true
-		return nil
+		return &reply, nil
 	} else {
-		ok, nodeAddress := node.closest_preceding_node(id)
+		ok, nodeAddress := n.closest_preceding_node(id)
 		if ok {
-			callOk := call(string(nodeAddress), "ChordNode.Find_successor", &arg, &reply)
+			newArgs := ctfp.FindSuccessorArgs{Key: args.Key}
+			callOk := n.call(string(nodeAddress), "FindSuccessor", &newArgs, &reply)
 			if callOk {
-				return nil
+				return &reply, nil
 			} else {
-				return errors.New("call to node on find_successor did not go through")
+				return nil, errors.New("call to node on FindSuccessor did not go through")
 			}
 		} else {
-			reply.Address = nodeAddress
+			reply.Address = string(nodeAddress)
 			reply.Ok = false
 			fmt.Println("couldn't find closest preceding node id: ", id)
 			fmt.Println("at node: ", nodeAddress)
-			fmt.Println("needs more time to update fingers")
-			return nil
+			fmt.Println("update fingers unable, waiting til next iteration")
+			return &reply, nil
 		}
 	}
 
 }
 
-func (newNode *ChordNode) join(address NodeAddress) {
+func (newNode *ChordNode) join(address NodeAddress) error {
 	newNode.mutex.Lock()
 	newNode.Predecessor = ""
 	newNode.mutex.Unlock()
-	args := FindClosestSuccessor{Id: newNode.Id}
-	reply := FindClosestSuccessorReply{}
-	fmt.Println("pre-call")
-	ok := call(string(address), "ChordNode.Find_successor", &args, &reply)
-	fmt.Println("post-call")
+	args := ctfp.FindSuccessorArgs{Key: string(newNode.Id)}
+	reply := ctfp.FindSuccessorReply{}
+	ok := newNode.call(string(address), "FindSuccessor", &args, &reply)
 	if !ok {
 		fmt.Println("could not join address, call issue: ", string(address))
-		return
+		return errors.New("could not join address, call issue")
 	} else if !reply.Ok {
-		fmt.Println("could not join address, find_successor issue: ", string(address))
-		return
+		fmt.Println("could not join address, FindSuccessor issue: ", string(address))
+		return errors.New("could not join address, FindSuccessor issue")
 	}
-	newNode.add_successor(reply.Address)
-	fmt.Println("successors changed: ", newNode.get_successor())
 
+	keyArgs := ctfp.GetAESKeyArgs{Key: newNode.RSAkeyPublic}
+	keyReply := ctfp.GetAESKeyReply{}
+
+	ok = newNode.call(string(reply.Address), "GetAESKey", &keyArgs, &keyReply)
+	if !ok {
+		fmt.Println("could not join address, call issue: ", string(address))
+		return errors.New("could not join address, call issue")
+	}
+
+	rsakey, _ := x509.ParsePKCS1PrivateKey(newNode.RSAkeyPrivate)
+	AESKey, err := RSA_OAEP_Decrypt(keyReply.AESKey, *rsakey)
+	if err != nil {
+		fmt.Println("unable to decrypt aes key")
+		return errors.New("cunable to decrypt aes key")
+	}
+	newNode.AESkey = AESKey
+	newNode.add_successor(NodeAddress(reply.Address))
+	fmt.Println("successors changed: ", newNode.get_successor())
+	return nil
 }
 
-func (node *ChordNode) fix_fingers() {
-	for i := range node.Fingers {
+func (n *ChordNode) fix_fingers() {
+	for i := range n.Fingers {
 		// fmt.Println(jump(node.Address, i))
-		arg := FindClosestSuccessor{Id: jump(node.Address, i)}
-		reply := FindClosestSuccessorReply{}
-		node.Find_successor(&arg, &reply)
+		arg := ctfp.FindSuccessorArgs{Key: string(jump(n.Address, i))}
+		reply, err := n.FindSuccessor(context.Background(), &arg)
+		if err != nil {
+			fmt.Println("FindSuccessor error: ", err)
+			return
+		}
 		if reply.Ok {
 
-			node.mutex.Lock()
-			node.Fingers[i] = reply.Address
-			node.mutex.Unlock()
+			n.mutex.Lock()
+			n.Fingers[i] = NodeAddress(reply.Address)
+			n.mutex.Unlock()
 		} else {
-			fmt.Println("find_successor error in fix_fingers: ")
+			fmt.Println("FindSuccessor error in fix_fingers: ")
 		}
 	}
 }
@@ -322,10 +441,10 @@ func (node *ChordNode) stabilize() {
 	if len(node.Successors) <= 0 {
 		return
 	}
-	reply := GetPredecessorReply{}
+	reply := ctfp.GetPredecessorReply{}
 	// fmt.Println("asking: ", string(node.Successors[0]), " for predecessor: ", reply.Address)
 	for {
-		if call(string(node.get_successor()), "ChordNode.GetPredecessor", &GetPredecessor{}, &reply) {
+		if node.call(string(node.get_successor()), "GetPredecessor", &ctfp.GetPredecessorArgs{}, &reply) {
 			break
 		}
 		fmt.Println("could not call predecessor: ", node.get_successor())
@@ -334,16 +453,20 @@ func (node *ChordNode) stabilize() {
 		}
 	}
 
-	reply_id := bigInt_to_key(hashAddress(reply.Address))
+	reply_id := bigInt_to_key(hashAddress(NodeAddress(reply.Address)))
 	transfer_files := false
 	if reply.Address != "" && between(node.Id, reply_id, bigInt_to_key(hashAddress(node.get_successor())), false) {
-		node.add_successor(reply.Address)
+		node.add_successor(NodeAddress(reply.Address))
 		transfer_files = true
 	}
 
-	arg := Notify{Address: node.Address, Bucket: node.Bucket}
-	notifyReply := NotifyReply{}
-	notifyCallOk := call(string(node.get_successor()), "ChordNode.Notify", &arg, &notifyReply)
+	kvpairs := []*ctfp.KeyValuePair{}
+	for k, v := range node.Bucket {
+		kvpairs = append(kvpairs, &ctfp.KeyValuePair{Key: k, Value: v})
+	}
+	arg := ctfp.NotifyArgs{Address: string(node.Address), Bucket: kvpairs}
+	notifyReply := ctfp.NotifyReply{}
+	notifyCallOk := node.call(string(node.get_successor()), "Notify", &arg, &notifyReply)
 	if !notifyCallOk {
 		fmt.Println("call to successor to notify err: ", node.get_successor())
 		return
@@ -351,14 +474,14 @@ func (node *ChordNode) stabilize() {
 	// fmt.Println("Successor did not update it's predecessor after notify: ", node.get_successor())
 	//	return
 	//}
-	if len(node.key) == 0 && len(notifyReply.Key) > 0 {
-		node.key = notifyReply.Key
-	}
+	// if len(node.AESkey) == 0 && len(notifyReply.Key) > 0 {
+	// 	node.key = notifyReply.Key
+	// }
 	pre_id := bigInt_to_key(hashAddress(node.Predecessor))
 	// fmt.Println("bucket: ", notifyReply.Bucket)
-	for file, content := range notifyReply.Bucket {
-		if between(pre_id, bigInt_to_key(hashFileName(file)), node.Id, true) {
-			node.Bucket[file] = content
+	for _, kv := range notifyReply.Bucket {
+		if between(pre_id, bigInt_to_key(hashFileName(kv.Key)), node.Id, true) {
+			node.Bucket[kv.Key] = kv.Value
 		}
 	}
 
@@ -371,40 +494,49 @@ func (node *ChordNode) stabilize() {
 		}
 	}
 
-	successorsArg := GetSuccessors{}
-	successorsReply := GetSuccessorsReply{}
-	successorsCallOk := call(string(node.get_successor()), "ChordNode.GetSuccessors", &successorsArg, &successorsReply)
+	successorsArg := ctfp.GetSuccessorsArgs{}
+	successorsReply := ctfp.GetSuccessorsReply{}
+	successorsCallOk := node.call(string(node.get_successor()), "GetSuccessors", &successorsArg, &successorsReply)
 	if !successorsCallOk {
 		fmt.Println("call to successor to get successors err: ", node.get_successor())
 		return
 	}
+	successors := []NodeAddress{}
+	for i := 0; i < len(successorsReply.Successors); i++ {
+		successors = append(successors, NodeAddress(successorsReply.Successors[i]))
+	}
 	node.mutex.Lock()
-	copy(node.Successors[1:], successorsReply.Successors[:len(successorsReply.Successors)-1])
+	copy(node.Successors[1:], successors[:len(successors)-1])
 	node.mutex.Unlock()
 }
 
-func (node *ChordNode) GetPredecessor(arg *GetPredecessor, reply *GetPredecessorReply) error {
+func (node *ChordNode) GetPredecessor(ctx context.Context, arg *ctfp.GetPredecessorArgs) (*ctfp.GetPredecessorReply, error) {
+	reply := ctfp.GetPredecessorReply{}
 	node.mutex.Lock()
 	defer node.mutex.Unlock()
-	reply.Address = node.Predecessor
+	reply.Address = string(node.Predecessor)
 	// fmt.Println("sending predecessor: ", reply.Address)
-	return nil
+	return &reply, nil
 }
 
-func (node *ChordNode) GetSuccessors(arg *GetSuccessors, reply *GetSuccessorsReply) error {
+func (node *ChordNode) GetSuccessors(ctx context.Context, arg *ctfp.GetSuccessorsArgs) (*ctfp.GetSuccessorsReply, error) {
+	reply := ctfp.GetSuccessorsReply{}
 	node.mutex.Lock()
 	defer node.mutex.Unlock()
-	reply.Successors = node.Successors
-	return nil
+	reply.Successors = []string{}
+	for _, successor := range node.Successors {
+		reply.Successors = append(reply.Successors, string(successor))
+	}
+	return &reply, nil
 }
 
 func (node *ChordNode) check_predecessor() {
 	if node.Predecessor == "" {
 		return
 	}
-	arg := GetPredecessor{}
-	reply := GetPredecessorReply{}
-	callOk := call(string(node.Predecessor), "ChordNode.GetPredecessor", &arg, &reply)
+	arg := ctfp.GetPredecessorArgs{}
+	reply := ctfp.GetPredecessorReply{}
+	callOk := node.call(string(node.Predecessor), "GetPredecessor", &arg, &reply)
 	if !callOk {
 		fmt.Println("predecessor call failed: ", node.Predecessor)
 		node.mutex.Lock()
@@ -417,61 +549,63 @@ func (node *ChordNode) check_predecessor() {
 	}
 }
 
-func (node *ChordNode) Notify(arg *Notify, reply *NotifyReply) error {
-	id := bigInt_to_key(hashAddress(arg.Address))
+func (node *ChordNode) Notify(ctx context.Context, arg *ctfp.NotifyArgs) (*ctfp.NotifyReply, error) {
+	reply := ctfp.NotifyReply{}
+	id := bigInt_to_key(hashAddress(NodeAddress(arg.Address)))
 	// fmt.Println("node.Predecessor: ", node.Predecessor)
 	if node.Predecessor == "" || between(bigInt_to_key(hashAddress(node.Predecessor)), id, node.Id, false) {
-		newMap := map[string][]byte{}
-		reply.Bucket = newMap
+		reply.Bucket = []*ctfp.KeyValuePair{}
 		node.mutex.Lock()
-		node.Predecessor = arg.Address
-		pre_id := bigInt_to_key(hashAddress(arg.Address))
+		node.Predecessor = NodeAddress(arg.Address)
+		pre_id := bigInt_to_key(hashAddress(NodeAddress(arg.Address)))
 		for file, content := range node.Bucket {
-			newMap[file] = content
+			reply.Bucket = append(reply.Bucket, &ctfp.KeyValuePair{Key: file, Value: content})
 			if !between(pre_id, bigInt_to_key(hashFileName(file)), node.Id, true) {
 				delete(node.Bucket, file)
 			}
 		}
-		if len(node.key) > 0 {
-			reply.Key = node.key
-		}
+		// if len(node.key) > 0 {
+		// 	reply.Key = node.key
+		// }
 		node.mutex.Unlock()
 		reply.Confirm = true
 		if node.Address == node.get_successor() {
 			node.mutex.Lock()
-			node.Successors[0] = arg.Address
+			node.Successors[0] = NodeAddress(arg.Address)
 			node.mutex.Unlock()
 		}
 	} else {
 		reply.Confirm = false
 	}
-	if node.Predecessor == arg.Address {
+	if node.Predecessor == NodeAddress(arg.Address) {
 		node.mutex.Lock()
 		pre_id := bigInt_to_key(hashAddress(node.Predecessor))
 		node.ExtraBucket = map[string][]byte{}
-		for file, content := range arg.Bucket {
-			if between(pre_id, bigInt_to_key(hashFileName(file)), node.Id, true) {
-				node.Bucket[file] = content
+		for _, kv := range arg.Bucket {
+			if between(pre_id, bigInt_to_key(hashFileName(kv.Key)), node.Id, true) {
+				node.Bucket[kv.Key] = kv.Value
 			} else {
-				node.ExtraBucket[file] = content
+				node.ExtraBucket[kv.Key] = kv.Value
 			}
 		}
 		node.mutex.Unlock()
 	}
-	return nil
+	return &reply, nil
 }
 
-func (n *ChordNode) Put(args *Put, reply *PutReply) error {
+func (n *ChordNode) Put(ctx context.Context, args *ctfp.PutArgs) (*ctfp.PutReply, error) {
+	reply := ctfp.PutReply{}
 	n.mutex.Lock()
 	defer n.mutex.Unlock()
 	fmt.Println("put file: ", args.FileName)
 
 	n.Bucket[args.FileName] = args.FileContent // security issue?
 	reply.Confirm = true
-	return nil
+	return &reply, nil
 }
 
-func (n *ChordNode) Get(args *Get, reply *GetReply) error {
+func (n *ChordNode) Get(ctx context.Context, args *ctfp.GetArgs) (*ctfp.GetReply, error) {
+	reply := ctfp.GetReply{}
 	n.mutex.Lock()
 	defer n.mutex.Unlock()
 	reply.Confirm = false
@@ -482,12 +616,13 @@ func (n *ChordNode) Get(args *Get, reply *GetReply) error {
 		reply.Content = val
 	}
 
-	return nil // security issue?
+	return &reply, nil // security issue?
 }
 
-func (n *ChordNode) Delete(args *Delete, reply *DeleteReply) error {
+func (n *ChordNode) Delete(ctx context.Context, args *ctfp.DeleteArgs) (*ctfp.DeleteReply, error) {
 	n.mutex.Lock()
 	defer n.mutex.Unlock()
+	reply := ctfp.DeleteReply{}
 	fmt.Println("delete: ", args.FileName)
 	reply.Confirm = false
 	_, ok := n.Bucket[args.FileName]
@@ -496,7 +631,7 @@ func (n *ChordNode) Delete(args *Delete, reply *DeleteReply) error {
 		reply.Confirm = true
 	}
 
-	return nil
+	return &reply, nil
 }
 
 func (n *ChordNode) StoreFile(fileName string) {
@@ -514,23 +649,25 @@ func (n *ChordNode) StoreFile(fileName string) {
 		return
 	}
 
-	bytes, r := aesEncyption(bytes, n.key)
+	bytes, r := aesEncyption(bytes, n.AESkey)
 	if r != nil {
 		fmt.Println("ErrorEncyptio:", r)
 	}
 	// fmt.Println("this is the encrypted data:", bytes)
 
-	arg := FindClosestSuccessor{Id: bigInt_to_key(hashFileName(fileName))}
-	reply := FindClosestSuccessorReply{}
-	n.Find_successor(&arg, &reply)
-
+	arg := ctfp.FindSuccessorArgs{Key: string(bigInt_to_key(hashFileName(fileName)))}
+	reply, err := n.FindSuccessor(context.Background(), &arg)
+	if err != nil {
+		fmt.Println("FindSuccessor error: ", err)
+		return
+	}
 	if !reply.Ok {
 		fmt.Println("could not find closest, try again!")
 		return
 	}
-	putArgs := Put{FileName: fileName, FileContent: bytes}
-	putReply := PutReply{}
-	callOk := call(string(reply.Address), "ChordNode.Put", &putArgs, &putReply)
+	putArgs := ctfp.PutArgs{FileName: fileName, FileContent: bytes}
+	putReply := ctfp.PutReply{}
+	callOk := n.call(string(reply.Address), "Put", &putArgs, &putReply)
 
 	if !callOk {
 		fmt.Println("call to put file on node failed: ", reply.Address)
@@ -543,17 +680,20 @@ func (n *ChordNode) StoreFile(fileName string) {
 }
 
 func (n *ChordNode) Lookup(fileName string) {
-	arg := FindClosestSuccessor{Id: bigInt_to_key(hashFileName(fileName))}
-	reply := FindClosestSuccessorReply{}
-	n.Find_successor(&arg, &reply)
+	arg := ctfp.FindSuccessorArgs{Key: string(bigInt_to_key(hashFileName(fileName)))}
+	reply, err := n.FindSuccessor(context.Background(), &arg)
+	if err != nil {
+		fmt.Println("FindSuccessor error: ", err)
+		return
+	}
 
 	if !reply.Ok {
 		fmt.Println("could not find closest, try again!")
 		return
 	}
-	getArgs := Get{FileName: fileName}
-	getReply := GetReply{}
-	callOk := call(string(reply.Address), "ChordNode.Get", &getArgs, &getReply)
+	getArgs := ctfp.GetArgs{FileName: fileName}
+	getReply := ctfp.GetReply{}
+	callOk := n.call(string(reply.Address), "Get", &getArgs, &getReply)
 
 	if !callOk {
 		fmt.Println("call to get file on node failed: ", reply.Address)
@@ -564,17 +704,17 @@ func (n *ChordNode) Lookup(fileName string) {
 		return
 	}
 
-	orginalData, r := aesdecrption(getReply.Content, n.key)
+	orginalData, r := aesdecrption(getReply.Content, n.AESkey)
 	if r != nil {
 		fmt.Println("Error decrypted data:", r)
 		return
 	}
-	fmt.Println("this is the decrypted data:", orginalData)
+	// fmt.Println("this is the decrypted data:", orginalData)
 
-	fmt.Println("Identifier: ", bigInt_to_key(hashAddress(reply.Address)), " Address: ", string(reply.Address), " Content: ", string(orginalData))
+	fmt.Println("Identifier: ", bigInt_to_key(hashAddress(NodeAddress(reply.Address))), " Address: ", string(reply.Address), " Content: \n", string(orginalData))
 }
 
-func (n *ChordNode) PrintState(args *Empty, reply *EmptyReply) error {
+func (n *ChordNode) PrintState(ctx context.Context, message *ctfp.EmptyArgs) (*ctfp.EmptyReply, error) {
 	n.mutex.Lock()
 	defer n.mutex.Unlock()
 	fmt.Println("\n\nNode:")
@@ -602,7 +742,7 @@ func (n *ChordNode) PrintState(args *Empty, reply *EmptyReply) error {
 		fmt.Println("	", file)
 	}
 
-	return nil
+	return &ctfp.EmptyReply{}, nil
 }
 
 // func (n *ChordNode) closest_preceding_node(id) {
@@ -627,43 +767,72 @@ func CreateChord(ip string, port string, n_successors int, ts int, tff int, tcp 
 	}
 	node.Id = bigInt_to_key(hashAddress(node.Address))
 
-	node.server()
+	return &node
+}
+
+func (node *ChordNode) startChord() {
+
+	node.grpc_server()
 
 	go node.background_stabilize()
 
 	go node.background_fix_fingers()
 
 	go node.background_check_predecessor()
-
-	return &node
 }
 
-func (node *ChordNode) server() error {
-	rpc.Register(node)
-	rpc.HandleHTTP()
+// func (node *ChordNode) server() error {
+// 	rpc.Register(node)
+// 	rpc.HandleHTTP()
 
+// 	l, e := net.Listen("tcp", string(node.Address))
+// 	if e != nil {
+// 		fmt.Println("unable to start node rpc server: ", e)
+// 		return e
+// 	}
+
+// 	go http.Serve(l, nil)
+
+// 	return nil
+// }
+
+func (node *ChordNode) grpc_server() error {
 	l, e := net.Listen("tcp", string(node.Address))
 	if e != nil {
 		fmt.Println("unable to start node rpc server: ", e)
 		return e
 	}
 
-	go http.Serve(l, nil)
+	creds := credentials.NewServerTLSFromCert(&node.ServerCert)
+
+	grpc_server := grpc.NewServer(grpc.Creds(creds))
+
+	ctfp.RegisterChordFileTransferServer(grpc_server, node)
+
+	go grpc_server.Serve(l)
 
 	return nil
 }
 
-func call(address string, rpcname string, args interface{}, reply interface{}) bool {
+func (node *ChordNode) call(address string, rpcname string, args interface{}, reply interface{}) bool {
 	// fmt.Println("address: ", address)
 	// fmt.Println("rpcname: ", rpcname)
-	c, err := rpc.DialHTTP("tcp", address)
+	// certificates, err := x509.ParseCertificates()
+	// if err != nil {
+	// 	fmt.Println("could not parse certificate in call...?")
+	// 	return false
+	// }
+
+	client := credentials.NewClientTLSFromCert(node.CaCert, "")
+	c, err := grpc.NewClient(address, grpc.WithTransportCredentials(client))
 	if err != nil {
 		fmt.Println("dialing error:", err)
 		return false
 	}
 	defer c.Close()
 
-	err = c.Call(rpcname, args, reply)
+	method := "ChordFileTransfer/" + rpcname
+	err = c.Invoke(context.Background(), method, args, reply)
 	if err == nil {
 		return true
 	}
@@ -708,10 +877,10 @@ func bigInt_to_key(big_int *big.Int) Key {
 	return Key(fmt.Sprintf("%x", big_int))
 }
 
-func key_to_bigInt(id Key) (*big.Int, bool) {
-	value, ok := new(big.Int).SetString(string(id), 16)
-	return value, ok
-}
+// func key_to_bigInt(id Key) (*big.Int, bool) {
+// 	value, ok := new(big.Int).SetString(string(id), 16)
+// 	return value, ok
+// }
 
 func jump(address NodeAddress, fingerentry int) Key {
 	var keySize = int64(crypto.SHA1.Size() * 8)
@@ -838,4 +1007,39 @@ func unpadding(data []byte) []byte {
 	length := len(data)
 	padding := int(data[length-1])
 	return data[:length-padding]
+}
+
+// RSA encryption
+func RSA_OAEP_Encrypt(data []byte, key rsa.PublicKey) ([]byte, error) {
+	label := []byte("OAEP Encrypted")
+	rng := rand.Reader
+	encoded, err := rsa.EncryptOAEP(sha256.New(), rng, &key, []byte(data), label)
+	if err != nil {
+		fmt.Println("unable to encrypt message")
+		return nil, err
+	}
+	return encoded, nil
+}
+
+func RSA_OAEP_Decrypt(encoded []byte, privKey rsa.PrivateKey) ([]byte, error) {
+	label := []byte("OAEP Encrypted")
+	rng := rand.Reader
+	data, err := rsa.DecryptOAEP(sha256.New(), rng, &privKey, encoded, label)
+	if err != nil {
+		fmt.Println("unable to decrypt message")
+		return nil, err
+	}
+	return data, nil
+}
+
+func (node *ChordNode) GetAESKey(ctx context.Context, args *ctfp.GetAESKeyArgs) (*ctfp.GetAESKeyReply, error) {
+	reply := ctfp.GetAESKeyReply{}
+	rsaKey, _ := x509.ParsePKCS1PublicKey(args.Key)
+	encodedAES, err := RSA_OAEP_Encrypt(node.AESkey, *rsaKey)
+	if err != nil {
+		fmt.Println("unable to encrypt aes: ", err)
+		return nil, errors.New("unable to encrypt aes")
+	}
+	reply.AESKey = encodedAES
+	return &reply, nil
 }
