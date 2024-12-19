@@ -116,13 +116,16 @@ func main() {
 	tcp := 500
 	n_successors := 5
 	id := ""
+	background := 0
 
 	for i := 1; i < len(os.Args); i += 2 {
 		fmt.Println("arg: ", os.Args[i], ", parameter: ", os.Args[i+1])
 		var err error = nil
 		switch os.Args[i] {
 		case "-a":
-			ip = os.Args[i+1]
+			if os.Args[i+1] != "-1" {
+				ip = os.Args[i+1]
+			}
 		case "-p":
 			port, err = strconv.Atoi(os.Args[i+1])
 			if port < 0 || port > 65535 {
@@ -130,10 +133,12 @@ func main() {
 				return
 			}
 		case "--ja":
-			chord_ip = os.Args[i+1]
+			if os.Args[i+1] != "-1" {
+				chord_ip = os.Args[i+1]
+			}
 		case "--jp":
 			chord_port, err = strconv.Atoi(os.Args[i+1])
-			if chord_port < 0 || chord_port > 65535 {
+			if (chord_port < 0 || chord_port > 65535) && chord_port != -1 {
 				fmt.Println("invalid chord_port argument: ", chord_port)
 				return
 			}
@@ -172,6 +177,11 @@ func main() {
 			if notValid || len(id) != 40 {
 				fmt.Println("id should be 40 characters of [0-9a-fA-F]: ", id)
 				return
+			}
+		case "-d":
+			background, err = strconv.Atoi(os.Args[i+1])
+			if err != nil {
+				background = 0
 			}
 		}
 
@@ -341,37 +351,42 @@ func main() {
 	node.call(string(node.Address), "PrintState", &arg, &reply)
 	// time.Sleep(10 * time.Second)
 
-	for {
-		reader := bufio.NewReader(os.Stdin)
-		fmt.Print("Enter text: ")
-		text, _ := reader.ReadString('\n')
-		text = strings.Trim(text, "\n \t\r")
-		textArr := strings.Fields(text)
-		fmt.Println(textArr)
-		if len(textArr) == 0 {
-			fmt.Println("invalid command: ", text)
-			continue
-		}
-		fmt.Println(textArr[0])
-		switch textArr[0] {
-		case "Lookup":
-			if len(textArr) < 2 {
-				fmt.Println("invalid argument: ", text)
+	if background == 0 {
+		for {
+			reader := bufio.NewReader(os.Stdin)
+			fmt.Print("Enter text: ")
+			text, _ := reader.ReadString('\n')
+			text = strings.Trim(text, "\n \t\r")
+			textArr := strings.Fields(text)
+			fmt.Println(textArr)
+			if len(textArr) == 0 {
+				fmt.Println("invalid command: ", text)
 				continue
 			}
-			node.Lookup(textArr[1])
-		case "StoreFile":
-			if len(textArr) < 2 {
-				fmt.Println("invalid argument: ", text)
-				continue
+			fmt.Println(textArr[0])
+			switch textArr[0] {
+			case "Lookup":
+				if len(textArr) < 2 {
+					fmt.Println("invalid argument: ", text)
+					continue
+				}
+				node.Lookup(textArr[1])
+			case "StoreFile":
+				if len(textArr) < 2 {
+					fmt.Println("invalid argument: ", text)
+					continue
+				}
+				node.StoreFile(textArr[1])
+			case "PrintState":
+				node.PrintState(context.TODO(), &ctfp.EmptyArgs{})
+			default:
+				fmt.Println("invalid command: ", text)
 			}
-			node.StoreFile(textArr[1])
-		case "PrintState":
-			node.PrintState(context.TODO(), &ctfp.EmptyArgs{})
-		default:
-			fmt.Println("invalid command: ", text)
 		}
 	}
+	for {
+	}
+
 }
 
 func (node *ChordNode) closest_preceding_node(id Key) (bool, NodeAddress) {
