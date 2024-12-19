@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -66,8 +67,9 @@ type ChordNode struct {
 	AESkey        []byte
 	RSAkeyPrivate []byte
 	RSAkeyPublic  []byte
-	ServerCert    tls.Certificate
-	CaCert        *x509.CertPool
+	ServerConfig  tls.Config
+	ClientConfig  tls.Config
+	CaCertPool    *x509.CertPool
 
 	ctfp.UnimplementedChordFileTransferServer
 }
@@ -252,24 +254,64 @@ func main() {
 	// 	return
 	// }
 	// node.ServerCert = certificate
-
-	serverCert, err := tls.LoadX509KeyPair("server.crt", "server.key")
-	if err != nil {
-		log.Fatalf("Failed to load server certificate and key: %v", err)
-	}
-	node.ServerCert = serverCert
-
 	caCert, err := os.ReadFile("ca.crt")
 	if err != nil {
 		log.Fatal("Failed to read CA certificate:", err)
 	}
 
+	// Parse the PEM-encoded certificate
+	block, _ := pem.Decode(caCert)
+	if block == nil {
+		log.Fatalf("Failed to parse PEM block containing the certificate")
+	}
+
+	// // Load the certificate
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		log.Fatalf("Failed to parse certificate: %v", err)
+	}
+	fmt.Println("cert ips:")
+	fmt.Println(cert.IPAddresses)
+
 	// Create a certificate pool
 	certPool := x509.NewCertPool()
-	if !certPool.AppendCertsFromPEM(caCert) {
-		log.Fatal("Failed to append CA certificates to pool")
+	certPool.AddCert(cert)
+
+	node.CaCertPool = certPool
+
+	serverCert, err := tls.LoadX509KeyPair("server_signed.crt", "server.key")
+	if err != nil {
+		log.Fatalf("Failed to load server certificate and key: %v", err)
 	}
-	node.CaCert = certPool
+	node.ServerConfig = tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		// ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs: certPool,
+	}
+
+	// Load client certificate and key
+	clientCert, err := tls.LoadX509KeyPair("client_signed.crt", "client.key")
+	if err != nil {
+		log.Fatalf("Failed to load client certificate and key: %v", err)
+	}
+
+	// Create TLS credentials for the client
+	node.ClientConfig = tls.Config{
+		Certificates: []tls.Certificate{clientCert},
+		RootCAs:      certPool,
+	}
+
+	// fmt.Println("cert:")
+	// fmt.Println(cert)
+	// fmt.Println("dnsNames:")
+	// fmt.Println(cert.DNSNames)
+	// fmt.Println("email:")
+	// fmt.Println(cert.EmailAddresses)
+	// fmt.Println("IP:")
+	// fmt.Println(cert.IPAddresses)
+	// fmt.Println("uris:")
+	// fmt.Println(cert.URIs)
+	// return
 
 	node.startChord()
 
@@ -803,9 +845,7 @@ func (node *ChordNode) grpc_server() error {
 		return e
 	}
 
-	creds := credentials.NewServerTLSFromCert(&node.ServerCert)
-
-	grpc_server := grpc.NewServer(grpc.Creds(creds))
+	grpc_server := grpc.NewServer(grpc.Creds(credentials.NewTLS(&node.ServerConfig)))
 
 	ctfp.RegisterChordFileTransferServer(grpc_server, node)
 
@@ -823,8 +863,7 @@ func (node *ChordNode) call(address string, rpcname string, args interface{}, re
 	// 	return false
 	// }
 
-	client := credentials.NewClientTLSFromCert(node.CaCert, "")
-	c, err := grpc.NewClient(address, grpc.WithTransportCredentials(client))
+	c, err := grpc.NewClient(address, grpc.WithTransportCredentials(credentials.NewTLS(&node.ClientConfig)))
 	if err != nil {
 		fmt.Println("dialing error:", err)
 		return false

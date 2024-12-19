@@ -1,19 +1,27 @@
-[req]
+[ req ]
 distinguished_name  = req_distinguished_name
-req_extensions     = v3_req
+req_extensions      = v3_req
 prompt              = no
 
 [req_distinguished_name]
 C                    = SE
 ST                   = Vastra Gotaland
-L                    = GOthenburg
+L                    = Gothenburg
 O                    = ChordBros
-OU                  = IT
+OU                   = IT
+CN                   = localhost
 
-[v3_req]
+
+[ v3_req ]
+subjectAltName      = @alt_names
 keyUsage             = digitalSignature, keyEncipherment
 extendedKeyUsage     = serverAuth
-subjectAltName       = alt_names
 
-[alt_names]
-IP.1 = 127.0.0.1
+[ alt_names ]
+DNS.1               = localhost
+IP.1                = 127.0.0.1
+
+[v3_ca]
+subjectKeyIdentifier     = hash
+authorityKeyIdentifier   = keyid:always,issuer:always
+basicConstraints        = critical, CA:TRUE 
