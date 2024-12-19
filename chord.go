@@ -855,8 +855,9 @@ func (node *ChordNode) startChord() {
 
 func (node *ChordNode) grpc_server() error {
 	address := string(node.Address)
-	index := strings.Index(address, ":")
-	l, e := net.Listen("tcp", "0.0.0.0"+address[index:])
+	// index := strings.Index(address, ":")
+	// l, e := net.Listen("tcp", "0.0.0.0"+address[index:])
+	l, e := net.Listen("tcp", address)
 	if e != nil {
 		fmt.Println("unable to start node rpc server: ", e)
 		return e
